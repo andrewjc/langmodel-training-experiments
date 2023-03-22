@@ -1,9 +1,13 @@
-jsonFilename = "alpaca_data_new.json"
+# BEGIN COLAB CONFIG POINT
 
+jsonFilename = "alpaca_data_new.json"
 # create a new H5 file
 train_h5_filename = 'alpaca_data_train.h5'
 test_h5_filename = 'alpaca_data_test.h5'
 useT5 = True
+forceRebuildDataset = True  # dataset cache not working as the tokenizer can't be detached
+
+# END COLAB CONFIG POINT
 
 import json
 import os
@@ -28,12 +32,13 @@ from tqdm import tqdm
 import transformers
 from transformers import LlamaForCausalLM, LlamaTokenizer, DataCollator
 
-CUTOFF_LEN = 256  # 256 accounts for about 96% of the data
+CUTOFF_LEN = 256  # Longer sequences require more memory and are slower to train
 LORA_R = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
-VAL_SET_SIZE = 0.2
+VAL_SET_SIZE = 0.2  # % of the dataset to use for validation
 
+# If using ROCM on AMD GPU still detects as a cuda device
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -54,6 +59,10 @@ def print_trainable_parameters(model):
     )
 
 
+class CastOutputToFloat(nn.Sequential):
+    def forward(self, x): return super().forward(x).to(torch.float32)
+
+
 if useT5:
     tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-small")
     tokenizer.pad_token_id = 0  # unk. we want this to be different from the eos token
@@ -64,7 +73,7 @@ else:
     tokenizer = LlamaTokenizer.from_pretrained(
         "decapoda-research/llama-7b-hf", add_eos_token=True,
     )
-    tokenizer.pad_token_id = 0  # unk. we want this to be different from the eos token
+    tokenizer.pad_token_id = 0
 
     model = LlamaForCausalLM.from_pretrained(
         "decapoda-research/llama-7b-hf",
@@ -95,11 +104,6 @@ for param in model.parameters():
 model.gradient_checkpointing_enable()  # reduce number of stored activations
 model.enable_input_require_grads()
 
-
-class CastOutputToFloat(nn.Sequential):
-    def forward(self, x): return super().forward(x).to(torch.float32)
-
-
 model.lm_head = CastOutputToFloat(model.lm_head)
 
 model = get_peft_model(model, config)
@@ -124,6 +128,7 @@ def generate_X(data_point):
     return generate_prompt_string(data_point)
 
 
+# Use </s> to indicate end of sentence, inference can check for this string and stop generating
 def generate_Y(data_point):
     return f"""{data_point["output"]} </s>"""
 
@@ -147,7 +152,7 @@ train_val = data.train_test_split(
 train_dataset = train_val["train"]
 test_dataset = train_val["test"]
 
-if True:
+if forceRebuildDataset:
     train_dataset = train_dataset.shuffle().map(lambda x: (generate_X(x), generate_Y(x)),
                                                 keep_in_memory=True,
                                                 load_from_cache_file=False).map(
@@ -176,16 +181,13 @@ else:
     train_dataset.load_from_disk("train_data.checkpoint")
     test_dataset.load_from_disk("val_data.checkpoint")
 
-# optimized for RTX 4090. for larger GPUs, increase some of these?
-MICRO_BATCH_SIZE = 4  # this could actually be 5 but i like powers of 2
 BATCH_SIZE = 64
-GRADIENT_ACCUMULATION_STEPS = 4
-EPOCHS = 5  # we don't need 3 tbh
-LEARNING_RATE = 1e-4  # the Karpathy constant
+GRADIENT_ACCUMULATION_STEPS = 3
+EPOCHS = 5
+LEARNING_RATE = 1e-4
 
 trainer = transformers.Trainer(
     model=model,
-    # train_dataset=train_ds,
     train_dataset=train_dataset,
     eval_dataset=test_dataset,
     args=transformers.TrainingArguments(
@@ -207,8 +209,6 @@ trainer = transformers.Trainer(
         load_best_model_at_end=True,
         # label_smoothing_factor=0.1,
     ),
-    #    prediction_loss_only=True,
-    # data_collator=T2TDataCollator(),
     data_collator=transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False),
 )
 model.config.use_cache = False
