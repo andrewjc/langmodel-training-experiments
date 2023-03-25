@@ -19,7 +19,7 @@ class LanguageModel(nn.Module):
         # Initialize the encoder
         encoder_layers = []
         for i in range(num_layers):
-            encoder_layers.append(nn.GRU(input_size=token_dim, hidden_size=hidden_dim, batch_first=True))
+            encoder_layers.append(nn.GRU(input_size=max_memory_size + token_dim, hidden_size=hidden_dim, batch_first=True))
             encoder_layers.append(nn.BatchNorm1d(hidden_dim))
             encoder_layers.append(nn.ReLU())
             encoder_layers.append(nn.Linear(hidden_dim, token_dim))
@@ -49,7 +49,7 @@ class LanguageModel(nn.Module):
         combined_input = torch.cat((input_tokens, memory_context), dim=0)
 
         # Pass the concatenated tokens through the encoder
-        encoder_output, _ = self.encoder(combined_input.unsqueeze(0))
+        encoder_output, _ = self.encoder(combined_input.unsqueeze(0).unsqueeze(-1).permute(0, 2, 1).reshape(1, -1, self.token_dim + self.max_memory_size))
 
         # Pass the encoder output through the decoder
         decoder_output = self.decoder(encoder_output)

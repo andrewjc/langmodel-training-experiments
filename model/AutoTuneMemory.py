@@ -31,13 +31,14 @@ class AutoMemoryModule(nn.Module):
         self.importance = torch.randn(0)
 
         self.score_net = nn.Sequential(
-            nn.Linear(token_dim, hidden_dim),
+            nn.Linear(max_memory_size, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, token_dim),
+            nn.Linear(hidden_dim, max_memory_size),
+            nn.Sigmoid(),
         )
 
         self.threshold_net = nn.Sequential(
-            nn.Linear(token_dim, hidden_dim),
+            nn.Linear(max_memory_size, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid(),
@@ -45,12 +46,14 @@ class AutoMemoryModule(nn.Module):
 
     def forward(self, sentence_tokens, memory_context):
         sentence_tokens = sentence_tokens.float()
+        padded_sentence_tokens = torch.cat([sentence_tokens, torch.zeros(self.max_memory_size - sentence_tokens.shape[0])])
 
         # Compute masks for sentence_tokens to ignore padding tokens during score computation
-        sentence_tokens_mask = (sentence_tokens != self.padding_token).unsqueeze(-1)
+        sentence_tokens_mask = (padded_sentence_tokens != self.padding_token)
 
         # Compute importance scores for the new tokens
-        new_importance_scores = self.score_net(sentence_tokens).squeeze()
+        # pad sentence_tokens to the max_memory_size
+        new_importance_scores = self.score_net(padded_sentence_tokens).squeeze()
         new_importance_scores = (new_importance_scores * sentence_tokens_mask.float()).squeeze()
 
         # Check if memory_context is not None, then compute importance scores and mask
@@ -66,15 +69,14 @@ class AutoMemoryModule(nn.Module):
 
         # Calculate the dynamic threshold for retaining tokens
 
-        threshold_factor = self.threshold_net(memory_context).item()
+        threshold_factor = self.threshold_net(current_importance_scores).item()
 
         # Combine new tokens and current memory context, along with their importance scores
-        combined_tokens = torch.cat([memory_context, sentence_tokens], dim=0)
+        combined_tokens = torch.cat([memory_context, padded_sentence_tokens], dim=0)
         combined_importance = torch.cat([current_importance_scores, new_importance_scores], dim=0)
 
         # Filter the tokens based on the dynamic threshold
-        threshold = threshold_factor * combined_importance.max()
-        mask = combined_importance >= threshold
+        mask = combined_importance >= threshold_factor
 
         # Update the memory context and importance
         memory_context = combined_tokens[mask]
@@ -85,5 +87,8 @@ class AutoMemoryModule(nn.Module):
             sorted_indices = torch.argsort(self.importance, descending=True)
             memory_context = memory_context[sorted_indices[:self.max_memory_size]]
             self.importance = self.importance[sorted_indices[:self.max_memory_size]]
+        else:
+            memory_context = torch.cat([memory_context, torch.zeros(self.max_memory_size - memory_context.shape[0])])
+            combined_importance = torch.cat([self.importance, torch.zeros(self.max_memory_size - self.importance.shape[0])])
 
         return memory_context.clone().detach(), combined_importance.clone().detach()
