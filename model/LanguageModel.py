@@ -1,50 +1,60 @@
 import torch
-import torch.nn as nn
+from torch import nn
 
 from model.AutoTuneMemory import AutoMemoryModule
-from model.LMBlock import LLMBlock
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, vocab_size, max_sentence_length, hidden_size, num_layers=1, dropout=0.0):
+    def __init__(self, vocab_size, token_dim, hidden_dim, num_layers, max_memory_size, padding_token=0):
         super(LanguageModel, self).__init__()
 
-        self.hidden_size = hidden_size
+        self.padding_token = padding_token
+        self.token_dim = token_dim
+        self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        self.embedding = nn.Embedding(vocab_size, hidden_size)
-        self.auto_memory = AutoMemoryModule(max_sentence_length, hidden_size)
+        # Initialize the AutoMemoryModule
+        self.memory_module = AutoMemoryModule(token_dim, hidden_dim, max_memory_size, padding_token)
 
-        self.encoder_blocks = nn.ModuleList()
+        # Initialize the encoder
+        encoder_layers = []
         for i in range(num_layers):
-            self.encoder_blocks.append(LLMBlock(hidden_size, hidden_size, dropout=dropout))
+            encoder_layers.append(nn.GRU(input_size=token_dim, hidden_size=hidden_dim, batch_first=True))
+            encoder_layers.append(nn.BatchNorm1d(hidden_dim))
+            encoder_layers.append(nn.ReLU())
+            encoder_layers.append(nn.Linear(hidden_dim, token_dim))
+            encoder_layers.append(nn.BatchNorm1d(token_dim))
+            encoder_layers.append(nn.ReLU())
+        self.encoder = nn.Sequential(*encoder_layers)
 
-        self.decoder_blocks = nn.ModuleList()
+        # Initialize the decoder
+        decoder_layers = []
         for i in range(num_layers):
-            self.decoder_blocks.append(LLMBlock(hidden_size, hidden_size, dropout=dropout))
+            decoder_layers.append(nn.Linear(token_dim, hidden_dim))
+            decoder_layers.append(nn.BatchNorm1d(hidden_dim))
+            decoder_layers.append(nn.ReLU())
+            decoder_layers.append(nn.Linear(hidden_dim, token_dim))
+            decoder_layers.append(nn.BatchNorm1d(token_dim))
+            decoder_layers.append(nn.ReLU())
+        self.decoder = nn.Sequential(*decoder_layers)
 
-        self.output_layer = nn.Linear(hidden_size, vocab_size)
+        # Initialize the output layer
+        self.output_layer = nn.Linear(token_dim, vocab_size)
 
     def forward(self, input_tokens, memory_context):
-        # Embed input tokens
-        embedded = self.embedding(input_tokens)
+        # Pass the input tokens and memory context through the AutoMemoryModule
+        memory_context, _ = self.memory_module(input_tokens, memory_context)
 
-        # Concatenate memory context
-        embedded = torch.cat([embedded, memory_context.unsqueeze(1)], dim=1)
+        # Concatenate the input tokens with the memory context
+        combined_input = torch.cat((input_tokens, memory_context), dim=0)
 
-        # Pass through auto memory
-        memory_context, importance_scores = self.auto_memory(embedded)
+        # Pass the concatenated tokens through the encoder
+        encoder_output, _ = self.encoder(combined_input.unsqueeze(0))
 
-        # Pass through encoder layer blocks
-        hidden = None
-        for block in self.encoder_blocks:
-            embedded, hidden = block(embedded, hidden)
+        # Pass the encoder output through the decoder
+        decoder_output = self.decoder(encoder_output)
 
-        # Pass through decoder layer blocks
-        for block in self.decoder_blocks:
-            embedded, _ = block(embedded, hidden)
+        # Compute the logit representing the next predicted token
+        output_logit = self.output_layer(decoder_output.squeeze(0))
 
-        # Pass through output layer
-        output = self.output_layer(embedded)
-
-        return output[:, -1, :], memory_context, importance_scores
+        return output_logit, memory_context

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+
 # LLM auto memory module
 # Provide a mechanism for self pruning of the memory context.
 #
@@ -20,8 +21,9 @@ import torch.nn as nn
 # important tokens.
 
 class AutoMemoryModule(nn.Module):
-    def __init__(self, token_dim, hidden_dim, max_memory_size):
+    def __init__(self, token_dim, hidden_dim, max_memory_size, padding_token=0):
         super(AutoMemoryModule, self).__init__()
+        self.padding_token = padding_token
         self.token_dim = token_dim
         self.hidden_dim = hidden_dim
         self.max_memory_size = max_memory_size
@@ -31,7 +33,7 @@ class AutoMemoryModule(nn.Module):
         self.score_net = nn.Sequential(
             nn.Linear(token_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, token_dim),
         )
 
         self.threshold_net = nn.Sequential(
@@ -42,13 +44,29 @@ class AutoMemoryModule(nn.Module):
         )
 
     def forward(self, sentence_tokens, memory_context):
-        # Compute importance scores for the new tokens and the current memory context
+        sentence_tokens = sentence_tokens.float()
+
+        # Compute masks for sentence_tokens to ignore padding tokens during score computation
+        sentence_tokens_mask = (sentence_tokens != self.padding_token).unsqueeze(-1)
+
+        # Compute importance scores for the new tokens
         new_importance_scores = self.score_net(sentence_tokens).squeeze()
-        current_importance_scores = self.score_net(memory_context).squeeze()
+        new_importance_scores = (new_importance_scores * sentence_tokens_mask.float()).squeeze()
+
+        # Check if memory_context is not None, then compute importance scores and mask
+        if memory_context is not None:
+            memory_context = memory_context.float()
+
+            memory_context_mask = (memory_context != self.padding_token).unsqueeze(-1)
+            current_importance_scores = self.score_net(memory_context).squeeze()
+            current_importance_scores = (current_importance_scores * memory_context_mask.float()).squeeze()
+        else:
+            current_importance_scores = torch.zeros_like(new_importance_scores)
+            memory_context = torch.zeros(self.max_memory_size)
 
         # Calculate the dynamic threshold for retaining tokens
-        context_mean = memory_context.mean(dim=0)
-        threshold_factor = self.threshold_net(context_mean).item()
+
+        threshold_factor = self.threshold_net(memory_context).item()
 
         # Combine new tokens and current memory context, along with their importance scores
         combined_tokens = torch.cat([memory_context, sentence_tokens], dim=0)
