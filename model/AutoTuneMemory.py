@@ -63,7 +63,6 @@ class AutoMemoryModule(nn.Module):
 
         ctx_padding_token_idx = torch.nonzero(memory_context != self.padding_token).squeeze(dim=1)
         filtered_memory_context = memory_context[ctx_padding_token_idx]
-        #filtered_memory_context_scoring = memory_context_scoring[ctx_padding_token_idx]
         filtered_memory_context_scoring = torch.index_select(memory_context_scoring, 0, ctx_padding_token_idx)
 
         # combine the filtered input tokens and their scores with the memory context
@@ -73,7 +72,7 @@ class AutoMemoryModule(nn.Module):
 
         # remove duplicate tokens and their scores
         unique_tokens, indices = torch.unique(combined_tokens, return_inverse=True)
-        unique_scores = torch.zeros_like(unique_tokens, dtype=scores.dtype)
+        unique_scores = torch.full_like(unique_tokens, -1e20, dtype=scores.dtype)
         unique_scores = unique_scores.scatter(0, indices, scores)
 
         # sort the combined tokens and their scores by the scores
@@ -84,9 +83,8 @@ class AutoMemoryModule(nn.Module):
         trimmed_combined_tokens = sorted_combined_tokens[:self.max_memory_context]
         trimmed_scores = sorted_scores[:self.max_memory_context]
 
-        # pad the trimmed tokens and their scores with padding tokens
+        # pad the trimmed tokens and their scores with padding tokens and -1e20 respectively
         trimmed_combined_tokens = nn.functional.pad(trimmed_combined_tokens, (0, self.max_memory_context - trimmed_combined_tokens.shape[-1]), value=self.padding_token)
-        trimmed_scores = nn.functional.pad(trimmed_scores, (0, self.max_memory_context - trimmed_scores.shape[-1]), value=0.0)
+        trimmed_scores = nn.functional.pad(trimmed_scores, (0, self.max_memory_context - trimmed_scores.shape[-1]), value=-1e20)
 
-        # build a new memory context by combining the trimmed tokens and their scores
         return trimmed_combined_tokens, trimmed_scores

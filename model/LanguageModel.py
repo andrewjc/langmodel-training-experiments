@@ -66,11 +66,11 @@ class EncoderBlock(nn.Module):
 
         # Initialize a GRU-based recurrent block
         self.rnn = nn.GRU(gru_in, gru_out, batch_first=True, bidirectional=True)
-        self.ln_rnn = nn.LayerNorm(gru_out)
-        self.dropout = nn.Dropout(p=dropout)
+        self.ln_rnn = nn.LayerNorm(gru_out*2)
+        self.dropout = nn.Dropout(p=dropout*2)
 
         # Initialize a dense layer
-        self.linear = nn.Linear(gru_out, output_size)
+        self.linear = nn.Linear(gru_out*2, output_size)
         temperature_scaled_init(self.linear.weight, temperature)
 
         # Add layer normalization to the recurrent block and dense layer
@@ -84,6 +84,7 @@ class EncoderBlock(nn.Module):
         self.apply(init_linear_kaiming_uniform_weights)
 
     def forward(self, x, h=None):
+
         # Apply dimensionality reduction
         x = self.linear_dim_red(x)
         x = self.activation_dim_red(x)
