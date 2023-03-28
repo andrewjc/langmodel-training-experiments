@@ -16,6 +16,7 @@ def temperature_scaled_init(weight, temperature):
     bound = math.sqrt(scale)
     nn.init.uniform_(weight, -bound, bound)
 
+
 def gumbel_softmax(logits, temperature, hard=False, dim=-1):
     gumbels = -torch.empty_like(logits).exponential_().log()
     logits_with_gumbel_noise = (logits + gumbels) / temperature
@@ -30,10 +31,12 @@ def gumbel_softmax(logits, temperature, hard=False, dim=-1):
 
     return y_hard
 
+
 def init_linear_kaiming_uniform_weights(m):
     if type(m) == nn.Linear:
         nn.init.kaiming_uniform_(m.weight)
         nn.init.zeros_(m.bias)
+
 
 def init_gru_xavier_uniform_weights(m):
     if type(m) == nn.GRU:
@@ -42,6 +45,13 @@ def init_gru_xavier_uniform_weights(m):
                 nn.init.xavier_uniform_(param)
             elif 'bias' in name:
                 nn.init.zeros_(param)
+
+
+def round_to_nearest_power_of_2(n):
+    power = round(math.log2(n))
+    return 2 ** power
+
+
 class EncoderBlock(nn.Module):
     def __init__(self, input_size, gru_in, gru_out, output_size, dropout=0.2, temperature=1.0):
         super(EncoderBlock, self).__init__()
@@ -55,18 +65,18 @@ class EncoderBlock(nn.Module):
         self.activation_dim_red = nn.ReLU()
 
         # Initialize a GRU-based recurrent block
-        self.rnn = nn.GRU(gru_in, gru_out, batch_first=True)
+        self.rnn = nn.GRU(gru_in, gru_out, batch_first=True, bidirectional=True)
+        self.ln_rnn = nn.LayerNorm(gru_out)
+        self.dropout = nn.Dropout(p=dropout)
 
         # Initialize a dense layer
         self.linear = nn.Linear(gru_out, output_size)
         temperature_scaled_init(self.linear.weight, temperature)
 
         # Add layer normalization to the recurrent block and dense layer
-        self.ln_rnn = nn.LayerNorm(gru_out)
         self.ln_linear = nn.LayerNorm(output_size)
 
         # Add dropout after the recurrent block and dense layer
-        self.dropout = nn.Dropout(p=dropout)
 
         self.activation = nn.ReLU()
 
@@ -86,14 +96,13 @@ class EncoderBlock(nn.Module):
         out = self.dropout(out)
 
         # Pass the output of the recurrent block through a dense layer
-        out = self.linear(out)
+        out = self.ln_linear(self.linear(out))
 
-        # Apply layer normalization and dropout to the output of the dense layer
-        out = self.ln_linear(out)
-        out = gumbel_softmax(out, self.temperature, hard=True)
+        out = self.activation(out)
         out = self.dropout(out)
 
         return out, h
+
 
 class DecoderLayer(nn.Module):
     def __init__(self, input_size, hidden_sizes, output_size):
@@ -110,47 +119,51 @@ class DecoderLayer(nn.Module):
             x = layer(x)
         return x
 
-def round_to_nearest_power_of_2(n):
-    power = round(math.log2(n))
-    return 2**power
 
 class LanguageModel(nn.Module):
-    def __init__(self, vocab_size, max_sentence_length, hidden_dim, num_layers, max_memory_size, padding_token=0, temperature=1.0, word2vec=None, device='cpu'):
+    def __init__(self, vocab_size, max_sentence_length, hidden_dim, layer_ratios, max_memory_size,
+                 padding_token=0, temperature=1.0, device='cpu'):
         super(LanguageModel, self).__init__()
 
         self.padding_token = padding_token
         self.max_sentence_length = max_sentence_length
         self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
         self.device = device
 
-        self.embedding_size = 128
+        self.embedding_size = 256
         self.temperature = temperature
 
         # Initialize the embedding layer
         self.embedding = nn.Embedding(vocab_size, self.embedding_size)
 
         # Initialize the AutoMemoryModule
-        self.memory_module = AutoMemoryModule(self.embedding, max_sentence_length, max_memory_size, self.embedding_size, padding_token, device)
+        self.memory_module = AutoMemoryModule(self.embedding, max_sentence_length, max_memory_size, self.embedding_size,
+                                              padding_token, device)
 
+        # Initialize the encoder blocks
+        first_encoder_input_size = (self.embedding_size * max_sentence_length) + (self.embedding_size * max_memory_size)
+        last_encoder_output_size = 128
 
-        # Initialize the encoder blocks [0, num_layers - 1]
-        enc_in = (self.embedding_size * max_sentence_length) + (self.embedding_size * max_memory_size)
-        enc_out = round_to_nearest_power_of_2(enc_in)
-        self.encoder = nn.ModuleList([
-            EncoderBlock(enc_in, 256, 256, 512, dropout=0.15, temperature=temperature),
-            EncoderBlock(512, 256, 128, 256, dropout=0.25, temperature=temperature),
-            EncoderBlock(256, 128, 64, 128, dropout=0.25, temperature=temperature),
-            EncoderBlock(128, 64, 64, 128, dropout=0.25, temperature=temperature),
-        ])
+        encoder_input_sizes = [first_encoder_input_size] + [
+            int(last_encoder_output_size + (first_encoder_input_size - last_encoder_output_size) * ratio) for ratio in
+            layer_ratios]
+        encoder_output_sizes = encoder_input_sizes[1:] + [last_encoder_output_size]
+
+        # Create the encoder layers based on the layer sizes
+        encoder_layers = []
+        for i in range(len(encoder_input_sizes)):
+            input_size = round_to_nearest_power_of_2(encoder_input_sizes[i])
+            output_size = round_to_nearest_power_of_2(encoder_output_sizes[i])
+            layer = EncoderBlock(input_size, 256, 256, output_size, dropout=0.15, temperature=temperature)
+            encoder_layers.append(layer)
+
+        self.encoder = nn.ModuleList(encoder_layers)
 
         # Initialize the decoder
-        self.decoder = DecoderLayer(128, [128, 64], vocab_size)
+        self.decoder = DecoderLayer(last_encoder_output_size, [128, 128], vocab_size)
 
-        # Add regularization to the decoder
-        #self.output_logits = nn.Linear(64, vocab_size)
-        #temperature_scaled_init(self.output_logits.weight, temperature)
-
+        self.apply(init_gru_xavier_uniform_weights)
+        self.apply(init_linear_kaiming_uniform_weights)
 
     def forward(self, input_tokens, memory_context, temperature=1.0):
 
@@ -173,20 +186,15 @@ class LanguageModel(nn.Module):
 
         # Pass the concatenated tokens through the encoder
         encoder_output = combined_input
-        for block in self.encoder:
-            encoder_output, _ = block(encoder_output)
+        for i in range(len(self.encoder)):
+            encoder_output, _ = self.encoder[i](encoder_output)
 
         # Pass the encoder output through the decoder
         decoder_output = encoder_output
         decoder_output = self.decoder(decoder_output)
-        #for i, block in enumerate(self.decoder):
-        #    decoder_output, _ = block(decoder_output)
 
-        # Pass decoder output through the regularization layer
-        #output_prob = self.output_logits(decoder_output.squeeze(0))
-
-        # Apply softmax activation function to obtain final output probabilities
-        output_prob = decoder_output # self.softmax(decoder_output.squeeze(0) / temperature)
+        # final output probabilities
+        output_prob = decoder_output
 
         return output_prob.squeeze(0), memory_context
 
@@ -203,7 +211,6 @@ class LanguageModel(nn.Module):
 
         # Initialize the generated token list with the input_ids
         generated_tokens = input_ids.tolist()
-
         # Generate tokens until the maximum length is reached or an end-of-sentence token is generated
         while len(generated_tokens[0]) < max_length:
             # Convert the generated tokens to a tensor
@@ -213,18 +220,16 @@ class LanguageModel(nn.Module):
             output_prob, memory_context = self(input_ids, memory_context, temperature)
 
             # Sample the next token from the output probabilities
-            try:
-                next_token = torch.multinomial(output_prob.exp(), num_samples=1).item()
 
-                # Add the next token to the generated token list
-                generated_tokens[0].append(next_token)
+            next_token = torch.multinomial(output_prob.exp(), num_samples=1).item()
 
-                # If the next token is an end-of-sentence token, break the loop
-                if next_token == self.padding_token:
-                    break
+            # Add the next token to the generated token list
+            generated_tokens[0].append(next_token)
 
-            except:
+            # If the next token is an end-of-sentence token, break the loop
+            if next_token == self.padding_token:
                 break
+
 
         # Decode the sequence
         generated_tokens = [tokenizer.decode(token) for token in generated_tokens]

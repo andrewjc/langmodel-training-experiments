@@ -4,6 +4,7 @@ from tqdm import tqdm
 from transformers import AutoModelForSeq2SeqLM, LlamaTokenizer
 from torch.cuda.amp import autocast, GradScaler
 from model.LanguageModel import LanguageModel
+from model.swa import SWA
 
 tokenizer = LlamaTokenizer.from_pretrained("theblackcat102/llama-fast-tokenizer")
 
@@ -91,10 +92,10 @@ class LargeJsonlDataset(Dataset):
 
 # Training parameters
 file_path = f"src.jsonl"
-tokenized_file_path = f"tokenized.jsonl"
-segment_length = 48
-max_train_lines = 1e6
-TRAIN_BATCH_SIZE = 128
+tokenized_file_path = f"/home/andrewc/Development/literotica_tokenized.jsonl"
+segment_length = 128
+max_train_lines = 1e8
+TRAIN_BATCH_SIZE = 256
 EVAL_BATCH_SIZE = 256
 num_epochs = 10
 learning_rate = 0.001
@@ -128,24 +129,22 @@ def train():
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=custom_collate_fn, num_workers=1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cpu"
 
-    scaler = GradScaler(enabled=True)
+    scaler = GradScaler(enabled=False)
 
-    # Initialize your language model, criterion, and optimizer here.
-    model = LanguageModel(
-        vocab_size=32000,
-        max_sentence_length=max_sentence_length,
-        hidden_dim=64,
-        num_layers=12,
-        max_memory_size=256,
-        padding_token=tokenizer.pad_token_id,
-        device=device).to(device)
+    model = LanguageModel(32000, max_sentence_length=max_sentence_length, hidden_dim=64, layer_ratios=[0.015, 0.015, 0.015, 0.015, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005], max_memory_size=256, padding_token=tokenizer.pad_token_id,
+                          temperature=1.0, device=device).to(device)
     print(model)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+
+    base_opt = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    optimizer = SWA(base_opt, swa_start = 10, swa_freq = 5)
+
+    #optimizer = base_opt
 
     # Add super convergence techniques
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=100, T_mult=2, eta_min=1e-6, last_epoch=-1)
+    loops = 100
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=loops, eta_min=1e-6, last_epoch=-1)
 
     for epoch in range(num_epochs):
         epoch_loss = 0.0
@@ -155,6 +154,14 @@ def train():
         progress_bar = tqdm(total=len(dataloader), desc="Training", position=0, leave=True)
 
         for batch_idx, batch_segments in enumerate(dataloader):
+            if batch_segments is None:
+                continue
+
+            if batch_segments[0] is None:
+                continue
+
+            if len(batch_segments[0]) == 0:
+                continue
 
             batch_segments = batch_segments[0]
 
@@ -162,37 +169,57 @@ def train():
 
             for segment in batch_segments:
                 segment = segment[0]
+                #print("Segment length: ", len(segment))
+                #print("Segment: ", segment)
 
-                input_data, target_data = process_segment(segment, max_sentence_length)
-                input_data = input_data.to(device)
-                target_data = target_data.to(device)
+                try:
 
-                with autocast():
-                    output, memory_context = model(input_data, memory_context)
-                    output = output.view(1, -1)
-                    loss = criterion(output, target_data.unsqueeze(0))
+                    input_data, target_data = process_segment(segment, max_sentence_length)
+                    input_data = input_data.to(device)
+                    target_data = target_data.to(device)
 
-                batch_loss += loss
-                segment_batch_count += 1
+                    def calcLoss(output, target):
+                        return torch.nn.functional.cross_entropy(output, target, ignore_index=tokenizer.pad_token_id)
 
-                if (segment_batch_count + 1) % TRAIN_BATCH_SIZE == 0:
-                    batch_loss /= TRAIN_BATCH_SIZE
-                    scaler.scale(batch_loss).backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
-                    scaler.step(optimizer)
+                    with autocast():
+                        output, memory_context = model(input_data, memory_context)
+                        output = output.view(1, -1)
+                        target = target_data.unsqueeze(0)
+                        loss = calcLoss(output, target)
+
+                    batch_loss += loss
+                    segment_batch_count += 1
+
+                    if (segment_batch_count + 1) % TRAIN_BATCH_SIZE == 0:
+                        batch_loss /= TRAIN_BATCH_SIZE
+                        batch_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        scheduler.step()  # Update the scheduler after optimizer.step()
+                        progress_bar.set_description(
+                            f"Epoch {epoch + 1}/{num_epochs} - Loss: {batch_loss:.4f} LR: {scheduler.get_last_lr()[0]:.6f}")
+                        batch_loss = 0
+
+                    # Check if we should run the generate sequence test code
+                    if (segment_batch_count + 1) % EVAL_BATCH_SIZE == 0:
+                        prompt = "Hello how are you?"
+                        input_data = tokenizer.encode(prompt, return_tensors="pt").to(device)
+                        output = model.generate(tokenizer, input_ids=input_data, max_length=max_sentence_length)
+                        print(f"Generated sentence: {output}")
+
+                    if (segment_batch_count + 1) % 100000 == 0:
+                        optimizer.update_swa()
+                        optimizer.swap_swa_sgd()
+                        torch.save(model.state_dict(), f"model_{segment_batch_count}.pt")
+                        optimizer.swap_swa_sgd()
+
+                except Exception as e:
+                    print("Error: ", e)
+                    # clear gradients
                     optimizer.zero_grad()
-                    scheduler.step()  # Update the scheduler after optimizer.step()
-                    scaler.update()  # Move this line here to update the scaler after scheduler.step()
-                    progress_bar.set_description(
-                        f"Epoch {epoch + 1}/{num_epochs} - Loss: {batch_loss:.4f} LR: {scheduler.get_last_lr()[0]:.6f}")
                     batch_loss = 0
-
-                # Check if we should run the generate sequence test code
-                if (segment_batch_count + 1) % EVAL_BATCH_SIZE == 0:
-                    prompt = "Hello how are you?"
-                    input_data = tokenizer.encode(prompt, return_tensors="pt").to(device)
-                    output = model.generate(tokenizer, input_ids=input_data, max_length=max_sentence_length)
-                    print(f"Generated sentence: {output}")
+                    continue
 
             progress_bar.update(1)
 
